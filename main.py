@@ -472,6 +472,7 @@ def send_animated(chat_id, lines: List[str], buttons=None):
             continue
         res = tg_call("sendMessageDraft", chat_id=chat_id, draft_id=draft_id, text="\n".join(shown), parse_mode="HTML")
         if not res.get("ok"):
+            print("sendMessageDraft failed:", res.get("description"))
             break
         time.sleep(0.45)
     return send(chat_id, "\n".join(lines), buttons)
@@ -773,6 +774,23 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
     else:
         handle_text(chat, text)
     return {"ok": True}
+
+@app.get("/bot/draft-test")
+def draft_test(key: str = ""):
+    if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):
+        raise HTTPException(403)
+    conn = db()
+    try:
+        rows = conn.execute("SELECT telegram_id FROM tk_users ORDER BY created_at LIMIT 3").fetchall()
+    finally:
+        conn.close()
+    out = {}
+    for r in rows:
+        uid = r["telegram_id"]
+        out[str(uid)] = [tg_call("sendMessageDraft", chat_id=uid, draft_id=7, text="Проверка анимации…"),
+                         tg_call("sendMessageDraft", chat_id=uid, draft_id=7, text="Проверка анимации… строка 2")]
+    out["me"] = tg_call("getMe")
+    return out
 
 @app.get("/bot/setup")
 def bot_setup(key: str = ""):

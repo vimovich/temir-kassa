@@ -792,6 +792,35 @@ def draft_test(key: str = ""):
     out["me"] = tg_call("getMe")
     return out
 
+@app.get("/bot/rich-test")
+def rich_test(key: str = "", step: int = 0):
+    if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):
+        raise HTTPException(403)
+    conn = db()
+    try:
+        uid = conn.execute("SELECT telegram_id FROM tk_users ORDER BY created_at LIMIT 1").fetchone()["telegram_id"]
+    finally:
+        conn.close()
+    md = ("## План на ноябрь\n\n"
+          "**3 000 000** из 4 000 000 сум\n\n"
+          "🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜ 75%\n\n"
+          "| Кому | Сумма | |\n| --- | ---: | --- |\n| Акмаль | 1 500 000 | ✅ |\n| Рассрочка | 1 250 000 | ⏳ |\n\n"
+          "---\n\n> Свободен в сентябре 2027")
+    html = ("<h2>План на ноябрь</h2><p><b>3 000 000</b> из 4 000 000 сум</p>"
+            "<table><tr><th>Кому</th><th>Сумма</th></tr><tr><td>Акмаль</td><td>1 500 000</td></tr></table>"
+            "<details><summary>Подробнее</summary><p>Тест сворачиваемого блока</p></details>")
+    kb = {"inline_keyboard": [[{"text": "Тест кнопки", "callback_data": "noop"}]]}
+    r1 = tg_call("sendRichMessage", chat_id=uid, rich_message={"markdown": md}, reply_markup=kb)
+    r2 = tg_call("sendRichMessage", chat_id=uid, rich_message={"html": html})
+    r3 = None
+    if r1.get("ok"):
+        mid = r1["result"]["message_id"]
+        time.sleep(1.5)
+        r3 = tg_call("editMessageText", chat_id=uid, message_id=mid,
+                     rich_message={"markdown": md.replace("3 000 000**", "3 500 000**").replace("75%", "88% ✅ обновлено")}, reply_markup=kb)
+    r4 = tg_call("sendRichMessageDraft", chat_id=uid, draft_id=11, rich_message={"markdown": "## Печатаю…"})
+    return {"md": r1, "html": r2, "edit": r3, "draft": r4}
+
 @app.get("/bot/setup")
 def bot_setup(key: str = ""):
     if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):

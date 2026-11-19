@@ -213,14 +213,16 @@ def jsonable(o):
         return o.isoformat()
     raise TypeError(type(o))
 
-def split_month(debts, monthly: float, strategy: str):
-    """Mirror of the app's split: fixed instalments first, then by strategy."""
+def split_month(debts, monthly: float, strategy: str, month_ym: int):
+    """Mirror of the app's split: this month's fixed instalments first, then by strategy."""
     pool = monthly
     alloc = {d["id"]: 0.0 for d in debts}
     open_ = [d for d in debts if not d["closed"]]
     for d in open_:
         if d["fixed"]:
-            a = min(d["fixed"] * (d["rate"] if d["cur"] == "USD" else 1), d["left_uzs"], pool)
+            paid_this = sum(p["amount"] for p in d["payments"] if ym(p["date"]) == month_ym)
+            need = max(0.0, d["fixed"] - paid_this) * (d["rate"] if d["cur"] == "USD" else 1)
+            a = min(need, d["left_uzs"], pool)
             alloc[d["id"]] += a; pool -= a
     rest = [d for d in open_ if not d["fixed"]]
     if strategy == "even":
@@ -526,7 +528,7 @@ def reminder_lines(user, debts, t: date):
         lines.append("✅ План этого месяца выполнен")
     else:
         lines.append(f"<b>Осталось отдать: {fmt(left_month)} сум</b>")
-        alloc = split_month(open_, left_month, user["strategy"] or "small")
+        alloc = split_month(open_, left_month, user["strategy"] or "small", ym(t))
         parts = [(d, alloc[d["id"]]) for d in open_ if alloc[d["id"]] > 0.5]
         if parts:
             lines += ["", "Как разделить:"]

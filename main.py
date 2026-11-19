@@ -1076,6 +1076,14 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
         handle_text(chat, text)
     return {"ok": True}
 
+@app.get("/bot/card-check")
+def card_check(key: str = ""):
+    if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):
+        raise HTTPException(403)
+    png = cards.debts_card({"count": 1, "left_all_s": "1 000", "pct": 0.5, "date": "тест",
+                            "rows": [{"who": "Тест", "hue": "blue", "left_s": "1 000 сум", "sub": "50%", "pct": .5, "due": "—", "late": False, "soon": False}]})
+    return {"ok": True, "bytes": len(png)}
+
 @app.get("/bot/setup")
 def bot_setup(key: str = ""):
     if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):

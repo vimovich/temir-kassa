@@ -492,7 +492,7 @@ def pbar(p: float, n: int = 10) -> str:
     k = max(0, min(n, round(p * n)))
     return "🟩" * k + "⬜" * (n - k)
 
-def send_rich(chat_id, md: str, keyboard=None, effect=None, stream=True, fallback=None):
+def send_rich(chat_id, md: str, keyboard=None, effect=None, stream=False, fallback=None):
     """Stream the card block by block as a draft, then send it. Falls back to plain HTML."""
     if stream:
         blocks = md.split("\n\n")
@@ -746,9 +746,13 @@ def post_month_card(uid, user, debts, t, stream=True):
     res = tg_photo(uid, month_card_png(user, debts, t), month_caption(user, debts, t), month_card_kb())
     if not res.get("ok"):
         return send_rich(uid, month_card_md(user, debts, t), month_card_kb(), stream=False, fallback=plan_lines(user, debts, t))
+    new_id = res["result"]["message_id"]
+    if user.get("card_msg_id") and user["card_msg_id"] != new_id:
+        tg_call("unpinChatMessage", chat_id=uid, message_id=user["card_msg_id"])
+    tg_call("pinChatMessage", chat_id=uid, message_id=new_id, disable_notification=True)
     conn = db()
     try:
-        conn.execute("UPDATE tk_users SET card_msg_id=%s, card_ym=%s WHERE telegram_id=%s", (res["result"]["message_id"], ym(t), uid))
+        conn.execute("UPDATE tk_users SET card_msg_id=%s, card_ym=%s WHERE telegram_id=%s", (new_id, ym(t), uid))
         conn.commit()
     finally:
         conn.close()
@@ -797,7 +801,7 @@ HELP = "\n".join([
     "Ошибся — нажми «↩️ Отменить» под ответом.",
     "",
     "<b>Команды</b>",
-    "/plan — живая карточка месяца: сколько отдать и кому, обновляется после каждого платежа",
+    "/plan — карточка месяца: кому и сколько отдать. Закрепится вверху чата и будет обновляться сама",
     "/dolgi — все долги с остатками",
     "/report — сводка: сколько отдано и когда свободен",
     "/help — эта подсказка",
@@ -910,14 +914,15 @@ def record_payment(chat, d, amount_cur, rate, pdate, note=""):
         conn.close()
     nd = next(x for x in debts if x["id"] == d["id"])
     kb = [[{"text": "↩️ Отменить", "callback_data": f"undo:{row['id']}"}, app_button("Открыть долг", f"debt-{nd['id']}")]]
-    cap = (f"🎉 <b>Долг «{esc(nd['who'])}» закрыт</b>" if nd["closed"] else
-           f"✅ <b>{esc(nd['who'])}</b> −{short_money(nd, amount_cur)} · осталось {short_money(nd, nd['left_cur'])}")
-    res = tg_photo(chat, payment_card_png(nd, amount_cur, pdate, note, user, debts), cap, kb,
-                   effect=EFFECT_PARTY if nd["closed"] else None)
-    if not res.get("ok"):
-        send_rich(chat, payment_card_md(nd, amount_cur, pdate, note, user, debts), kb, stream=False,
-                  effect=EFFECT_PARTY if nd["closed"] else None,
-                  fallback=[f"✅ Записал: {esc(nd['who'])} −{short_money(nd, amount_cur)}", f"Осталось: {short_money(nd, nd['left_cur'])}"])
+    when = "" if pdate == today() else f", {pdate.day} {MONTHS_G[pdate.month - 1]}"
+    if nd["closed"]:
+        line = f"🎉 <b>{esc(nd['who'])}</b> −{short_money(nd, amount_cur)}{when} · долг закрыт полностью"
+    else:
+        extra = f" (≈ {fmt(nd['left_uzs'])} сум)" if nd["cur"] == "USD" else ""
+        line = f"✅ <b>{esc(nd['who'])}</b> −{short_money(nd, amount_cur)}{when} · осталось {short_money(nd, nd['left_cur'])}{extra}"
+    if note:
+        line += f"\n<i>{esc(note)}</i>"
+    send(chat, line, [[{"text": "↩️ Отменить", "callback_data": f"undo:{row['id']}"}]])
     refresh_month_card(chat)
 
 def plan_lines(user, debts, t: date):
@@ -1065,7 +1070,7 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
             if cmd == "/plan":
                 post_month_card(chat, user, debts, t)
             elif cmd == "/report":
-                send_rich(chat, report_card_md(user, debts, t), [[app_button("Открыть приложение")]], fallback=summary_lines(user, debts, t))
+                send(chat, "\n".join(summary_lines(user, debts, t)), [[app_button("Открыть приложение")]])
             else:
                 kb = [[app_button("Отметить оплату", "pay"), app_button("Открыть")]]
                 if not [d for d in debts if not d["closed"]] or not tg_photo(chat, debts_card_png(debts, t), "<b>Мои долги</b>", kb).get("ok"):
@@ -1075,14 +1080,6 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
     else:
         handle_text(chat, text)
     return {"ok": True}
-
-@app.get("/bot/card-check")
-def card_check(key: str = ""):
-    if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):
-        raise HTTPException(403)
-    png = cards.debts_card({"count": 1, "left_all_s": "1 000", "pct": 0.5, "date": "тест",
-                            "rows": [{"who": "Тест", "hue": "blue", "left_s": "1 000 сум", "sub": "50%", "pct": .5, "due": "—", "late": False, "soon": False}]})
-    return {"ok": True, "bytes": len(png)}
 
 @app.get("/bot/setup")
 def bot_setup(key: str = ""):
@@ -1206,8 +1203,7 @@ def cron_daily(authorization: str = Header(default=""), day: Optional[int] = Non
             if t.day in (1, 10, 20) and u["remind_on"] and open_:
                 post_month_card(u["telegram_id"], u, debts, t, stream=False); sent += 1
             if t.day == 1 and u["report_on"]:
-                send_rich(u["telegram_id"], report_card_md(u, debts, t, prev_month=True), [[app_button("Открыть приложение")]],
-                          fallback=report_lines(u, debts, t)); sent += 1
+                send(u["telegram_id"], "\n".join(report_lines(u, debts, t)), [[app_button("Открыть приложение")]]); sent += 1
             if u["due_alert_on"]:
                 for d in open_:
                     if d["due"] and (d["due"] - t).days == 7:

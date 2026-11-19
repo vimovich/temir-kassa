@@ -4,7 +4,7 @@ Runs on Vercel (FastAPI) with Neon Postgres. Every /api request must carry the
 Telegram WebApp initData in the X-Init-Data header; it is verified with the bot
 token, so a user can only ever read and change their own data.
 """
-import hashlib, hmac, io, json, os, time
+import hashlib, hmac, io, json, logging, os, time
 from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 from urllib.parse import parse_qsl
@@ -18,6 +18,8 @@ from pydantic import BaseModel, Field, field_validator
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
+
+logging.getLogger("httpx").setLevel(logging.WARNING)  # its request log would print the bot token
 
 app = FastAPI(title="Temir Kassa API")
 app.add_middleware(
@@ -510,7 +512,8 @@ def bot_setup(key: str = ""):
     b = tg_call("setMyCommands", commands=[{"command": "start", "description": "Открыть Temir Kassa"},
                                            {"command": "report", "description": "Сводка по долгам"}])
     c = tg_call("setChatMenuButton", menu_button={"type": "web_app", "text": "Открыть", "web_app": {"url": APP_URL}})
-    return {"webhook": a, "commands": b, "menu": c}
+    info = tg_call("getWebhookInfo")
+    return {"webhook": a, "commands": b, "menu": c, "info": info}
 
 # ─── Messages ─────────────────────────────────────────────
 def reminder_lines(user, debts, t: date):

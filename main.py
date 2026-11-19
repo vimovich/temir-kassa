@@ -512,8 +512,20 @@ def bot_setup(key: str = ""):
     b = tg_call("setMyCommands", commands=[{"command": "start", "description": "Открыть Temir Daftar"},
                                            {"command": "report", "description": "Сводка по долгам"}])
     c = tg_call("setChatMenuButton", menu_button={"type": "web_app", "text": "Открыть", "web_app": {"url": APP_URL}})
+    names = tg_call("setMyName", name="Temir Daftar")
+    about = tg_call("setMyShortDescription", short_description="Система учёта долгов, платежей и плана погашения")
+    desc = tg_call("setMyDescription", description="Записывай долги в сумах и долларах, отмечай платежи и смотри, когда будешь свободен. "
+                                                    "Бот напомнит 10 и 20 числа, сколько осталось отдать в этом месяце.")
+    try:
+        import base64
+        from avatar_data import AVATAR_JPG_B64
+        photo = httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/setMyProfilePhoto",
+                           data={"photo": json.dumps({"type": "static", "photo": "attach://avatar"})},
+                           files={"avatar": ("avatar.jpg", base64.b64decode(AVATAR_JPG_B64), "image/jpeg")}, timeout=30).json()
+    except Exception as e:
+        photo = {"ok": False, "description": str(e)}
     info = tg_call("getWebhookInfo")
-    return {"webhook": a, "commands": b, "menu": c, "info": info}
+    return {"webhook": a, "commands": b, "menu": c, "name": names, "about": about, "description": desc, "photo": photo, "info": info}
 
 # ─── Messages ─────────────────────────────────────────────
 def reminder_lines(user, debts, t: date):

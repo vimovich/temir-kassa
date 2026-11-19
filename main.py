@@ -487,8 +487,10 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
     if not chat or (msg.get("chat") or {}).get("type") != "private":
         return {"ok": True}
     if text.startswith("/start"):
-        send(chat, "<b>Temir Daftar</b> — учёт долгов.\n\nЗапиши долги, отмечай платежи, а я напомню 10 и 20 числа, "
-                   "сколько осталось отдать в этом месяце.", [[app_button("Открыть Temir Daftar")]])
+        send(chat, "<b>Temir Daftar</b> — тетрадь твоих долгов.\n\n"
+                   "Записывай, кому и сколько должен, и отмечай платежи. Я посчитаю, когда ты закроешь все долги, "
+                   "и подскажу, как делить деньги каждый месяц.\n\n"
+                   "Напоминания и отчёты включаются в настройках приложения.", [[app_button("Открыть Temir Daftar")]])
     elif text.startswith("/report"):
         conn = db()
         try:
@@ -515,7 +517,7 @@ def bot_setup(key: str = ""):
     names = tg_call("setMyName", name="Temir Daftar")
     about = tg_call("setMyShortDescription", short_description="Система учёта долгов, платежей и плана погашения")
     desc = tg_call("setMyDescription", description="Записывай долги в сумах и долларах, отмечай платежи и смотри, когда будешь свободен. "
-                                                    "Бот напомнит 10 и 20 числа, сколько осталось отдать в этом месяце.")
+                                                    "План подскажет, сколько отдавать каждый месяц, а напоминания можно включить в настройках.")
     try:
         import base64
         from avatar_data import AVATAR_JPG_B64

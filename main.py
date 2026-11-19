@@ -101,6 +101,8 @@ def init_db(conn):
         rate         DOUBLE PRECISION,
         created_at   TIMESTAMPTZ DEFAULT now()
     )""")
+    conn.execute("ALTER TABLE tk_users ADD COLUMN IF NOT EXISTS card_msg_id BIGINT")
+    conn.execute("ALTER TABLE tk_users ADD COLUMN IF NOT EXISTS card_ym INTEGER")
     conn.execute("CREATE INDEX IF NOT EXISTS tk_debts_user ON tk_debts(telegram_id)")
     conn.execute("CREATE INDEX IF NOT EXISTS tk_pay_user ON tk_payments(telegram_id)")
     conn.commit()
@@ -341,9 +343,10 @@ def add_payment(p: PaymentIn, tg=Depends(current_user)):
             VALUES(%s,%s,%s,%s,%s) RETURNING id""",
             (tg["id"], p.debt_id, p.date, p.amount, p.rate if d["cur"] == "USD" else None)).fetchone()
         conn.commit()
-        return {"ok": True, "id": row["id"]}
     finally:
         conn.close()
+    refresh_month_card(tg["id"])
+    return {"ok": True, "id": row["id"]}
 
 @app.delete("/api/payments/{pay_id}")
 def delete_payment(pay_id: int, tg=Depends(current_user)):
@@ -351,9 +354,10 @@ def delete_payment(pay_id: int, tg=Depends(current_user)):
     try:
         conn.execute("DELETE FROM tk_payments WHERE id=%s AND telegram_id=%s", (pay_id, tg["id"]))
         conn.commit()
-        return {"ok": True}
     finally:
         conn.close()
+    refresh_month_card(tg["id"])
+    return {"ok": True}
 
 @app.patch("/api/settings")
 def update_settings(s: SettingsIn, tg=Depends(current_user)):
@@ -477,6 +481,187 @@ def send_animated(chat_id, lines: List[str], buttons=None):
         time.sleep(0.45)
     return send(chat_id, "\n".join(lines), buttons)
 
+
+# ─── Rich cards ───────────────────────────────────────────
+EFFECT_PARTY = "5046509860389126442"  # 🎉
+
+def mdx(s: str) -> str:
+    return re.sub(r"([\\`*_\[\]|#>~])", r"\\\1", str(s))
+
+def pbar(p: float, n: int = 10) -> str:
+    k = max(0, min(n, round(p * n)))
+    return "🟩" * k + "⬜" * (n - k)
+
+def send_rich(chat_id, md: str, keyboard=None, effect=None, stream=True, fallback=None):
+    """Stream the card block by block as a draft, then send it. Falls back to plain HTML."""
+    if stream:
+        blocks = md.split("\n\n")
+        draft_id = int(time.time() * 10) % 2_000_000_000 or 1
+        for i in range(1, len(blocks)):
+            res = tg_call("sendRichMessageDraft", chat_id=chat_id, draft_id=draft_id, rich_message={"markdown": "\n\n".join(blocks[:i])})
+            if not res.get("ok"):
+                print("rich draft failed:", res.get("description"))
+                break
+            time.sleep(0.35)
+    payload = {"chat_id": chat_id, "rich_message": {"markdown": md}}
+    if keyboard:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    if effect:
+        payload["message_effect_id"] = effect
+    res = tg_call("sendRichMessage", **payload)
+    if not res.get("ok"):
+        print("sendRichMessage failed:", res.get("description"))
+        if fallback:
+            return send(chat_id, "\n".join(fallback), keyboard)
+    return res
+
+def edit_rich(chat_id, message_id, md: str, keyboard=None):
+    payload = {"chat_id": chat_id, "message_id": message_id, "rich_message": {"markdown": md}}
+    if keyboard is not None:
+        payload["reply_markup"] = {"inline_keyboard": keyboard}
+    return tg_call("editMessageText", **payload)
+
+def month_card_md(user, debts, t: date) -> str:
+    open_ = [d for d in debts if not d["closed"]]
+    plan = user["monthly_plan"] or 0
+    paid = paid_in_month_uzs(debts, ym(t))
+    left_all = sum(d["left_uzs"] for d in debts)
+    parts = [f"## План на {MONTHS[t.month - 1]}"]
+    if not open_:
+        return "\n\n".join(parts + ["🎉 **Открытых долгов нет. Ты свободен!**"])
+    if plan <= 0:
+        return "\n\n".join(parts + ["План не задан. Открой приложение → «План» и укажи, сколько готов отдавать в месяц."])
+    p = min(1, paid / plan)
+    parts.append(f"**{fmt(paid)}** из {fmt(plan)} сум")
+    parts.append(f"{pbar(p)} {round(p * 100)}%")
+    # per-debt: what the plan asked at the start of the month vs. paid this month
+    start = []  # debts as they stood on the 1st, so the plan column does not shift as you pay
+    for d in debts:
+        r_ = d["rate"] if d["cur"] == "USD" else 1
+        back = sum(x["amount"] for x in d["payments"] if ym(x["date"]) == ym(t))
+        lc = d["left_cur"] + back
+        if lc > 0.005:
+            start.append({**d, "left_cur": lc, "left_uzs": lc * r_, "closed": False})
+    base = split_month(start, plan, user["strategy"] or "small", -1)
+    rows = ["| Кому | По плану | Отдано | |", "| --- | ---: | ---: | :---: |"]
+    for d in sorted(debts, key=lambda d: d["due"] or date(9999, 1, 1)):
+        r_ = d["rate"] if d["cur"] == "USD" else 1
+        got = sum(x["amount"] * r_ for x in d["payments"] if ym(x["date"]) == ym(t))
+        need = max(base.get(d["id"], 0.0), 0.0)
+        if need < 0.5 and got < 0.5:
+            continue
+        mark = "✅" if got >= need - 0.5 else ("◐" if got > 0.5 else "⏳")
+        rows.append(f"| {mdx(d['who'])} | {fmt(need)} | {fmt(got)} | {mark} |")
+    if len(rows) > 2:
+        parts.append("\n".join(rows))
+    left_m = max(0.0, plan - paid)
+    parts.append("✅ **План месяца выполнен**" if left_m <= 0.5 else f"Осталось в этом месяце: **{fmt(left_m)} сум**")
+    fm = free_month(debts, plan, ym(t))
+    parts.append("---")
+    parts.append(f"> Всего осталось {fmt(left_all)} сум" + (f" · свободен в {ym_label(fm)}" if fm is not None else ""))
+    return "\n\n".join(parts)
+
+def month_card_kb():
+    return [[app_button("Отметить оплату", "pay"), app_button("Открыть")]]
+
+def post_month_card(uid, user, debts, t, stream=True):
+    res = send_rich(uid, month_card_md(user, debts, t), month_card_kb(), stream=stream,
+                    fallback=plan_lines(user, debts, t))
+    if res.get("ok") and res.get("result", {}).get("rich_message"):
+        conn = db()
+        try:
+            conn.execute("UPDATE tk_users SET card_msg_id=%s, card_ym=%s WHERE telegram_id=%s",
+                         (res["result"]["message_id"], ym(t), uid))
+            conn.commit()
+        finally:
+            conn.close()
+    return res
+
+def refresh_month_card(uid):
+    """Update this month's live card in place after any payment change."""
+    try:
+        conn = db()
+        try:
+            user, debts = load_state(conn, uid)
+        finally:
+            conn.close()
+        t = today()
+        if not user or not user.get("card_msg_id") or user.get("card_ym") != ym(t):
+            return
+        edit_rich(uid, user["card_msg_id"], month_card_md(user, debts, t), month_card_kb())
+    except Exception as e:
+        print("refresh card failed:", e)
+
+def payment_card_md(d, amount_cur, pdate, note, user, debts):
+    t = today()
+    when = "сегодня" if pdate == t else f"{pdate.day} {MONTHS_G[pdate.month - 1]}"
+    pct = (d["amount"] - d["left_cur"]) / d["amount"]
+    parts = ["## 🎉 Долг закрыт!" if d["closed"] else "## ✅ Платёж записан",
+             f"**{mdx(d['who'])}** −{short_money(d, amount_cur)}, {when}" + (f"\n_{mdx(note)}_" if note else ""),
+             f"{pbar(pct)} {round(pct * 100)}%"]
+    rows = ["| | |", "| --- | ---: |",
+            f"| Отдано по долгу | {short_money(d, d['paid_cur'])} |",
+            f"| Осталось | {short_money(d, d['left_cur'])} |"]
+    if d["cur"] == "USD" and not d["closed"]:
+        rows.append(f"| Осталось в сумах | ≈ {fmt(d['left_uzs'])} |")
+    plan = user["monthly_plan"] or 0
+    if plan > 0:
+        paid = paid_in_month_uzs(debts, ym(t))
+        rows.append(f"| План на {MONTHS[t.month - 1]} | {fmt(paid)} из {fmt(plan)} |")
+    parts.append("\n".join(rows))
+    left = sum(x["left_uzs"] for x in debts)
+    fm = free_month(debts, plan, ym(t))
+    parts.append("> " + ("**Ты свободен от долгов!**" if left <= 0.5 else
+                         (f"Свободен в {ym_label(fm)}" if fm is not None else f"Всего осталось {fmt(left)} сум")))
+    return "\n\n".join(parts)
+
+def debts_card_md(debts, t: date):
+    open_ = sorted([d for d in debts if not d["closed"]], key=lambda d: d["due"] or date(9999, 1, 1))
+    if not open_:
+        return "## Мои долги\n\n🎉 **Открытых долгов нет. Ты свободен!**"
+    rows = ["| Кому | Осталось | % | Срок |", "| --- | ---: | ---: | --- |"]
+    for d in open_:
+        pct = round((d["amount"] - d["left_cur"]) / d["amount"] * 100)
+        due = "—"
+        if d["due"]:
+            due = "⚠️ просрочен" if d["due"] < t else f"{d['due'].day:02d}.{d['due'].month:02d}.{str(d['due'].year)[2:]}"
+        rows.append(f"| {mdx(d['who'])} | {short_money(d, d['left_cur'])} | {pct}% | {due} |")
+    left = sum(d["left_uzs"] for d in debts)
+    total = sum(d["amount"] * (d["rate"] if d["cur"] == "USD" else 1) for d in debts)
+    p = (total - left) / total if total else 0
+    parts = [f"## Мои долги · {len(open_)}", "\n".join(rows),
+             f"Всего осталось: **{fmt(left)} сум**", f"{pbar(p)} закрыто {round(p * 100)}%"]
+    usd_ = [d for d in open_ if d["cur"] == "USD"]
+    if usd_:
+        parts.append("> Долларовые долги в сумах считаются по курсу, когда брал")
+    return "\n\n".join(parts)
+
+def report_card_md(user, debts, t: date, prev_month: bool = False):
+    left, total = totals(debts)
+    p = (total - left) / total if total else 0
+    plan = user["monthly_plan"] or 0
+    if prev_month:
+        pm = ym(t) - 1
+        title = f"## Итоги: {MONTHS[pm % 12]} {pm // 12}"
+        paid = paid_in_month_uzs(debts, pm)
+        paid_row = f"| Отдано за месяц | {fmt(paid)} сум |"
+    else:
+        title = f"## Сводка на {t.day} {MONTHS_G[t.month - 1]}"
+        paid = paid_in_month_uzs(debts, ym(t))
+        paid_row = f"| Отдано в {MONTHS_IN[t.month - 1]} | {fmt(paid)}" + (f" из {fmt(plan)}" if plan else "") + " сум |"
+    rows = ["| | |", "| --- | ---: |", paid_row, f"| Осталось всего | {fmt(left)} сум |",
+            f"| Открытых долгов | {len([d for d in debts if not d['closed']])} |"]
+    parts = [title, f"{pbar(p)} закрыто {round(p * 100)}%", "\n".join(rows)]
+    if prev_month:
+        closed = [mdx(d["who"]) for d in debts if d["closed"] and d["payments"] and ym(d["payments"][-1]["date"]) == ym(t) - 1]
+        if closed:
+            parts.append("🎉 Закрыл полностью: " + ", ".join(closed))
+    fm = free_month(debts, plan, ym(t))
+    parts.append("> " + ("**Ты свободен от долгов!**" if left <= 0.5 else
+                         (f"**Свободен в {ym_label(fm)}** при {fmt(plan)} сум в месяц" if fm is not None else
+                          "Задай сумму в месяц в разделе «План», и я посчитаю дату свободы")))
+    return "\n\n".join(parts)
+
 # ─── Bot: chat payments and commands ──────────────────────
 import re
 
@@ -504,14 +689,14 @@ HELP = "\n".join([
     "Ошибся — нажми «↩️ Отменить» под ответом.",
     "",
     "<b>Команды</b>",
-    "/plan — сколько отдать в этом месяце и кому",
+    "/plan — живая карточка месяца: сколько отдать и кому, обновляется после каждого платежа",
     "/dolgi — все долги с остатками",
     "/report — сводка: сколько отдано и когда свободен",
     "/help — эта подсказка",
 ])
 
 COMMANDS = [
-    {"command": "plan", "description": "Сколько отдать в этом месяце и кому"},
+    {"command": "plan", "description": "Живая карточка месяца: кому и сколько"},
     {"command": "dolgi", "description": "Все долги с остатками"},
     {"command": "report", "description": "Сводка: отдано и когда свободен"},
     {"command": "help", "description": "Как записать платёж и все команды"},
@@ -616,22 +801,11 @@ def record_payment(chat, d, amount_cur, rate, pdate, note=""):
     finally:
         conn.close()
     nd = next(x for x in debts if x["id"] == d["id"])
-    when = "сегодня" if pdate == today() else f"{pdate.day} {MONTHS_G[pdate.month - 1]}"
-    lines = [f"✅ Записал: <b>{esc(nd['who'])}</b> −{short_money(nd, amount_cur)}, {when}"]
-    if note:
-        lines.append(f"<i>{note}</i>")
-    if nd["closed"]:
-        lines.append(f"🎉 Долг «{esc(nd['who'])}» закрыт полностью!")
-    else:
-        extra = f" (≈ {fmt(nd['left_uzs'])} сум)" if nd["cur"] == "USD" else ""
-        lines.append(f"Осталось по долгу: {short_money(nd, nd['left_cur'])}{extra}")
-    t = today()
-    plan = user["monthly_plan"] or 0
-    if plan > 0:
-        paid = paid_in_month_uzs(debts, ym(t))
-        lines.append(f"План на {MONTHS[t.month - 1]}: {fmt(paid)} из {fmt(plan)} сум ({min(100, round(paid / plan * 100))}%)")
-    lines += free_line(user, debts, t, sum(x["left_uzs"] for x in debts))
-    send_animated(chat, lines, [[{"text": "↩️ Отменить", "callback_data": f"undo:{row['id']}"}], [app_button("Открыть приложение")]])
+    kb = [[{"text": "↩️ Отменить", "callback_data": f"undo:{row['id']}"}, app_button("Открыть долг", f"debt-{nd['id']}")]]
+    send_rich(chat, payment_card_md(nd, amount_cur, pdate, note, user, debts), kb,
+              effect=EFFECT_PARTY if nd["closed"] else None,
+              fallback=[f"✅ Записал: {esc(nd['who'])} −{short_money(nd, amount_cur)}", f"Осталось: {short_money(nd, nd['left_cur'])}"])
+    refresh_month_card(chat)
 
 def plan_lines(user, debts, t: date):
     open_ = [d for d in debts if not d["closed"]]
@@ -716,10 +890,14 @@ def handle_callback(cb):
             conn.commit()
         finally:
             conn.close()
-        old = cb["message"].get("text", "")
-        tg_call("editMessageText", chat_id=chat, message_id=cb["message"]["message_id"],
-                text=("↩️ <b>Отменено.</b> Платёж удалён.\n\n<s>" + esc(old.split("\n")[0]) + "</s>") if row else "Этот платёж уже удалён.",
-                parse_mode="HTML")
+        mid = cb["message"]["message_id"]
+        md = "## ↩️ Платёж отменён\n\nСумма вернулась в остаток долга." if row else "## Этот платёж уже удалён"
+        if cb["message"].get("rich_message"):
+            edit_rich(chat, mid, md, [[app_button("Открыть приложение")]])
+        else:
+            tg_call("editMessageText", chat_id=chat, message_id=mid, text="↩️ <b>Платёж отменён.</b> Сумма вернулась в остаток долга." if row else "Этот платёж уже удалён.", parse_mode="HTML")
+        if row:
+            refresh_month_card(chat)
         return
     if data.startswith("p:"):
         _, did, amount, d_, rate, is_usd = data.split(":")
@@ -767,59 +945,17 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
             send(chat, "Пока нет долгов. Добавь первый в приложении.", [[app_button("Открыть Temir Daftar")]])
         else:
             t = today()
-            lines = summary_lines(user, debts, t) if cmd == "/report" else plan_lines(user, debts, t) if cmd == "/plan" else debts_lines(debts, t)
-            send_animated(chat, lines, [[app_button("Открыть приложение")]])
+            if cmd == "/plan":
+                post_month_card(chat, user, debts, t)
+            elif cmd == "/report":
+                send_rich(chat, report_card_md(user, debts, t), [[app_button("Открыть приложение")]], fallback=summary_lines(user, debts, t))
+            else:
+                send_rich(chat, debts_card_md(debts, t), [[app_button("Отметить оплату", "pay"), app_button("Открыть")]], fallback=debts_lines(debts, t))
     elif cmd:
         send(chat, "Не знаю такой команды.\n\n" + HELP)
     else:
         handle_text(chat, text)
     return {"ok": True}
-
-@app.get("/bot/draft-test")
-def draft_test(key: str = ""):
-    if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):
-        raise HTTPException(403)
-    conn = db()
-    try:
-        rows = conn.execute("SELECT telegram_id FROM tk_users ORDER BY created_at LIMIT 3").fetchall()
-    finally:
-        conn.close()
-    out = {}
-    for r in rows:
-        uid = r["telegram_id"]
-        out[str(uid)] = [tg_call("sendMessageDraft", chat_id=uid, draft_id=7, text="Проверка анимации…"),
-                         tg_call("sendMessageDraft", chat_id=uid, draft_id=7, text="Проверка анимации… строка 2")]
-    out["me"] = tg_call("getMe")
-    return out
-
-@app.get("/bot/rich-test")
-def rich_test(key: str = "", step: int = 0):
-    if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):
-        raise HTTPException(403)
-    conn = db()
-    try:
-        uid = conn.execute("SELECT telegram_id FROM tk_users ORDER BY created_at LIMIT 1").fetchone()["telegram_id"]
-    finally:
-        conn.close()
-    md = ("## План на ноябрь\n\n"
-          "**3 000 000** из 4 000 000 сум\n\n"
-          "🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜ 75%\n\n"
-          "| Кому | Сумма | |\n| --- | ---: | --- |\n| Акмаль | 1 500 000 | ✅ |\n| Рассрочка | 1 250 000 | ⏳ |\n\n"
-          "---\n\n> Свободен в сентябре 2027")
-    html = ("<h2>План на ноябрь</h2><p><b>3 000 000</b> из 4 000 000 сум</p>"
-            "<table><tr><th>Кому</th><th>Сумма</th></tr><tr><td>Акмаль</td><td>1 500 000</td></tr></table>"
-            "<details><summary>Подробнее</summary><p>Тест сворачиваемого блока</p></details>")
-    kb = {"inline_keyboard": [[{"text": "Тест кнопки", "callback_data": "noop"}]]}
-    r1 = tg_call("sendRichMessage", chat_id=uid, rich_message={"markdown": md}, reply_markup=kb)
-    r2 = tg_call("sendRichMessage", chat_id=uid, rich_message={"html": html})
-    r3 = None
-    if r1.get("ok"):
-        mid = r1["result"]["message_id"]
-        time.sleep(1.5)
-        r3 = tg_call("editMessageText", chat_id=uid, message_id=mid,
-                     rich_message={"markdown": md.replace("3 000 000**", "3 500 000**").replace("75%", "88% ✅ обновлено")}, reply_markup=kb)
-    r4 = tg_call("sendRichMessageDraft", chat_id=uid, draft_id=11, rich_message={"markdown": "## Печатаю…"})
-    return {"md": r1, "html": r2, "edit": r3, "draft": r4}
 
 @app.get("/bot/setup")
 def bot_setup(key: str = ""):
@@ -940,11 +1076,11 @@ def cron_daily(authorization: str = Header(default=""), day: Optional[int] = Non
             if not debts:
                 continue
             open_ = [d for d in debts if not d["closed"]]
-            if t.day in (10, 20) and u["remind_on"] and open_:
-                send(u["telegram_id"], "\n".join(reminder_lines(u, debts, t)),
-                     [[app_button("Отметить оплату", "pay")], [app_button("Открыть приложение")]]); sent += 1
+            if t.day in (1, 10, 20) and u["remind_on"] and open_:
+                post_month_card(u["telegram_id"], u, debts, t, stream=False); sent += 1
             if t.day == 1 and u["report_on"]:
-                send_animated(u["telegram_id"], report_lines(u, debts, t), [[app_button("Открыть приложение")]]); sent += 1
+                send_rich(u["telegram_id"], report_card_md(u, debts, t, prev_month=True), [[app_button("Открыть приложение")]],
+                          fallback=report_lines(u, debts, t)); sent += 1
             if u["due_alert_on"]:
                 for d in open_:
                     if d["due"] and (d["due"] - t).days == 7:

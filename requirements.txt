@@ -2,3 +2,4 @@ fastapi
 openpyxl
 pydantic
 psycopg[binary]
+httpx

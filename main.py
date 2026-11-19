@@ -476,33 +476,302 @@ def send_animated(chat_id, lines: List[str], buttons=None):
         time.sleep(0.45)
     return send(chat_id, "\n".join(lines), buttons)
 
+# ─── Bot: chat payments and commands ──────────────────────
+import re
+
+WELCOME = ("<b>Temir Daftar</b> — тетрадь твоих долгов.\n\n"
+           "Записывай, кому и сколько должен, и отмечай платежи. Я посчитаю, когда ты закроешь все долги, "
+           "и подскажу, как делить деньги каждый месяц.\n\n"
+           "Напоминания и отчёты включаются в настройках приложения.\n"
+           "Все быстрые команды и примеры — /help")
+
+HELP = "\n".join([
+    "💰 <b>Отдал часть долга — напиши мне одной строкой:</b>",
+    "кому и сколько",
+    "<code>Акмаль 500 000</code>",
+    "<i>→ запишу платёж Акмалю, 500 000 сум, сегодня</i>",
+    "",
+    "📅 <b>Отдал в другой день</b> — добавь дату:",
+    "<code>Акмаль 500к 12.11</code>",
+    "",
+    "💵 <b>Долг в долларах:</b>",
+    "<code>Джасур 200$</code>",
+    "или сумами по курсу того дня:",
+    "<code>Джасур 2,6 млн по 12 900</code>",
+    "",
+    "Сумму можно писать как удобно: <code>5 млн</code>, <code>5м</code>, <code>500к</code> или <code>5 000 000</code>.",
+    "Ошибся — нажми «↩️ Отменить» под ответом.",
+    "",
+    "<b>Команды</b>",
+    "/plan — сколько отдать в этом месяце и кому",
+    "/dolgi — все долги с остатками",
+    "/report — сводка: сколько отдано и когда свободен",
+    "/help — эта подсказка",
+])
+
+COMMANDS = [
+    {"command": "plan", "description": "Сколько отдать в этом месяце и кому"},
+    {"command": "dolgi", "description": "Все долги с остатками"},
+    {"command": "report", "description": "Сводка: отдано и когда свободен"},
+    {"command": "help", "description": "Как записать платёж и все команды"},
+    {"command": "start", "description": "Открыть Temir Daftar"},
+]
+
+MULT = {"млн": 1e6, "миллион": 1e6, "mln": 1e6, "м": 1e6, "m": 1e6, "тыс": 1e3, "т": 1e3, "к": 1e3, "k": 1e3}
+NUM = r"(\d{1,3}(?:[  ]\d{3})+|\d+(?:[.,]\d+)?)"
+
+def _num(s: str) -> float:
+    return float(s.replace(" ", "").replace(" ", "").replace(",", "."))
+
+def parse_payment_text(text: str, t: date):
+    """Pull date, rate, amount and the remaining words (the name) out of a chat message."""
+    s = " " + text.lower().replace("ё", "е") + " "
+    out = {"date": t, "rate": None, "usd": False, "amount": None}
+    md = re.search(r"\s(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?=\s)", s)
+    if md:
+        d_, m_, y_ = int(md.group(1)), int(md.group(2)), md.group(3)
+        y = int(y_) + (2000 if y_ and len(y_) == 2 else 0) if y_ else t.year
+        try:
+            dd = date(y, m_, d_)
+            if not y_ and dd > t:
+                dd = date(y - 1, m_, d_)
+            out["date"] = dd
+        except ValueError:
+            return {"error": "Не понял дату. Пиши так: <code>12.11</code> или <code>12.11.2026</code>"}
+        s = s[:md.start()] + " " + s[md.end():]
+    mr = re.search(r"\s(?:по|курс)\s*" + NUM + r"(?=\s)", s)
+    if mr:
+        out["rate"] = _num(mr.group(1))
+        s = s[:mr.start()] + " " + s[mr.end():]
+    ma = re.search(r"(\$)?\s*" + NUM + r"\s*(млн|миллион\w*|mln|тыс\w*|м|m|т|к|k)?(?![a-zа-я0-9])\s*(\$|долл\w*|usd|у\.?е\.?)?", s)
+    if not ma:
+        return {"error": None}
+    v = _num(ma.group(2))
+    suf = (ma.group(3) or "")
+    for k, mult in MULT.items():
+        if suf.startswith(k):
+            v *= mult
+            break
+    out["amount"] = v
+    out["usd"] = bool(ma.group(1) or ma.group(4))
+    s = s[:ma.start()] + " " + s[ma.end():]
+    out["name"] = re.sub(r"[^\w\s-]", " ", s).strip()
+    return out
+
+def match_debts(name: str, debts):
+    words = [w for w in re.split(r"\s+", name) if len(w) >= 2]
+    scored = []
+    for d in debts:
+        who = d["who"].lower().replace("ё", "е")
+        sc = 0
+        if name and name == who:
+            sc = 1000
+        elif name and (name in who or who in name):
+            sc = 100
+        else:
+            dw = [w for w in re.split(r"[^\w]+", who) if len(w) >= 2]
+            for w in words:
+                for x in dw:
+                    if x == w:
+                        sc = max(sc, 50 + len(w))
+                    elif len(w) >= 3 and (x.startswith(w) or w.startswith(x)):
+                        sc = max(sc, 20 + min(len(w), len(x)))
+        if sc:
+            scored.append((sc, d))
+    if not scored:
+        return []
+    top = max(s for s, _ in scored)
+    return [d for s, d in scored if s == top]
+
+def payment_from(d, amount, usd, rate, uzs_input: bool):
+    """Return (amount in debt currency, rate stored, note) or error text."""
+    if d["cur"] == "UZS":
+        if usd:
+            return None, None, "Этот долг в сумах. Напиши сумму в сумах."
+        return amount, None, ""
+    if usd or (not rate and amount < 10000):
+        return amount, rate, ""
+    r = rate or d["rate"]
+    note = "" if rate else f"по курсу взятия {fmt(d['rate'])}"
+    return round(amount / r, 2), r, note
+
+def short_money(d, v):
+    return usd(v) if d["cur"] == "USD" else f"{fmt(v)} сум"
+
+def record_payment(chat, d, amount_cur, rate, pdate, note=""):
+    if amount_cur <= 0:
+        return send(chat, "Сумма должна быть больше нуля.")
+    if amount_cur > d["left_cur"] + 0.01:
+        return send(chat, f"Это больше остатка: по долгу «{esc(d['who'])}» осталось {short_money(d, d['left_cur'])}. Не записал.",
+                    [[app_button("Открыть долг", f"debt-{d['id']}")]])
+    if pdate > today():
+        return send(chat, "Дата в будущем. Запиши платёж, когда отдашь.")
+    conn = db()
+    try:
+        row = conn.execute("INSERT INTO tk_payments(telegram_id,debt_id,date,amount,rate) VALUES(%s,%s,%s,%s,%s) RETURNING id",
+                           (chat, d["id"], pdate, amount_cur, rate if d["cur"] == "USD" else None)).fetchone()
+        conn.commit()
+        user, debts = load_state(conn, chat)
+    finally:
+        conn.close()
+    nd = next(x for x in debts if x["id"] == d["id"])
+    when = "сегодня" if pdate == today() else f"{pdate.day} {MONTHS_G[pdate.month - 1]}"
+    lines = [f"✅ Записал: <b>{esc(nd['who'])}</b> −{short_money(nd, amount_cur)}, {when}"]
+    if note:
+        lines.append(f"<i>{note}</i>")
+    if nd["closed"]:
+        lines.append(f"🎉 Долг «{esc(nd['who'])}» закрыт полностью!")
+    else:
+        extra = f" (≈ {fmt(nd['left_uzs'])} сум)" if nd["cur"] == "USD" else ""
+        lines.append(f"Осталось по долгу: {short_money(nd, nd['left_cur'])}{extra}")
+    t = today()
+    plan = user["monthly_plan"] or 0
+    if plan > 0:
+        paid = paid_in_month_uzs(debts, ym(t))
+        lines.append(f"План на {MONTHS[t.month - 1]}: {fmt(paid)} из {fmt(plan)} сум ({min(100, round(paid / plan * 100))}%)")
+    lines += free_line(user, debts, t, sum(x["left_uzs"] for x in debts))
+    send_animated(chat, lines, [[{"text": "↩️ Отменить", "callback_data": f"undo:{row['id']}"}], [app_button("Открыть приложение")]])
+
+def plan_lines(user, debts, t: date):
+    open_ = [d for d in debts if not d["closed"]]
+    if not open_:
+        return ["🎉 Открытых долгов нет. Ты свободен!"]
+    plan = user["monthly_plan"] or 0
+    if plan <= 0:
+        return ["<b>План не задан</b>", "", "Открой приложение → «План» и укажи, сколько готов отдавать в месяц. Тогда я посчитаю, кому и сколько."]
+    paid = paid_in_month_uzs(debts, ym(t))
+    left = max(0.0, plan - paid)
+    lines = [f"<b>План на {MONTHS[t.month - 1]}</b>", "",
+             f"Отдано: {fmt(paid)} из {fmt(plan)} сум"]
+    if left <= 0.5:
+        lines.append("✅ План этого месяца выполнен")
+    else:
+        lines.append(f"<b>Осталось отдать: {fmt(left)} сум</b>")
+        alloc = split_month(open_, left, user["strategy"] or "small", ym(t))
+        parts = [(d, alloc[d["id"]]) for d in open_ if alloc[d["id"]] > 0.5]
+        if parts:
+            lines += ["", "Кому и сколько:"]
+            for d, a in parts:
+                extra = f" (≈ {usd(a / d['rate'])})" if d["cur"] == "USD" else ""
+                lines.append(f"• {esc(d['who'])} — {fmt(a)} сум{extra}")
+    return lines
+
+def debts_lines(debts, t: date):
+    open_ = sorted([d for d in debts if not d["closed"]], key=lambda d: d["due"] or date(9999, 1, 1))
+    if not open_:
+        return ["🎉 Открытых долгов нет. Ты свободен!"]
+    lines = [f"<b>Мои долги · {len(open_)}</b>", ""]
+    for d in open_:
+        pct = round((d["amount"] - d["left_cur"]) / d["amount"] * 100)
+        due = ""
+        if d["due"]:
+            days = (d["due"] - t).days
+            due = " · ⚠️ просрочен" if days < 0 else f" · до {d['due'].day} {MONTHS_G[d['due'].month - 1]}" + (f" {d['due'].year}" if d["due"].year != t.year else "")
+        extra = f" (≈ {fmt(d['left_uzs'])} сум)" if d["cur"] == "USD" else ""
+        lines.append(f"• <b>{esc(d['who'])}</b> — {short_money(d, d['left_cur'])}{extra}")
+        lines.append(f"   отдано {pct}%{due}")
+    left = sum(d["left_uzs"] for d in debts)
+    lines += ["", f"<b>Всего осталось: {fmt(left)} сум</b>"]
+    return lines
+
+def handle_text(chat, text):
+    conn = db()
+    try:
+        user, debts = load_state(conn, chat)
+    finally:
+        conn.close()
+    open_ = [d for d in debts if not d["closed"]]
+    if not open_:
+        return send(chat, "Сначала добавь долг в приложении, потом сможешь отмечать платежи прямо здесь.\n\nПодсказка — /help",
+                    [[app_button("Открыть Temir Daftar")]])
+    p = parse_payment_text(text, today())
+    if p.get("error"):
+        return send(chat, p["error"])
+    if not p.get("amount"):
+        return send(chat, "Не нашёл сумму. Напиши так: <code>Акмаль 500 000</code>\n\nВсе примеры — /help")
+    cands = match_debts(p["name"], open_)
+    if len(cands) != 1:
+        opts = cands or open_
+        title = "Кому из них?" if cands else ("Не нашёл такое имя. Кому отдал?" if p["name"] else "Кому отдал?")
+        rate = int(p["rate"]) if p["rate"] else 0
+        kb = [[{"text": f"{d['who']} · осталось {short_money(d, d['left_cur'])}",
+                 "callback_data": f"p:{d['id']}:{p['amount']:g}:{p['date'].isoformat()}:{rate}:{1 if p['usd'] else 0}"}] for d in opts[:8]]
+        return send(chat, f"{title}\nСумма: {usd(p['amount']) if p['usd'] else fmt(p['amount']) + ' сум'}", kb)
+    d = cands[0]
+    amt, rate, note = payment_from(d, p["amount"], p["usd"], p["rate"], True)
+    if amt is None:
+        return send(chat, note)
+    record_payment(chat, d, amt, rate, p["date"], note)
+
+def handle_callback(cb):
+    chat = cb["message"]["chat"]["id"]
+    data = cb.get("data", "")
+    tg_call("answerCallbackQuery", callback_query_id=cb["id"])
+    if data.startswith("undo:"):
+        pid = int(data[5:])
+        conn = db()
+        try:
+            row = conn.execute("DELETE FROM tk_payments WHERE id=%s AND telegram_id=%s RETURNING id", (pid, chat)).fetchone()
+            conn.commit()
+        finally:
+            conn.close()
+        old = cb["message"].get("text", "")
+        tg_call("editMessageText", chat_id=chat, message_id=cb["message"]["message_id"],
+                text=("↩️ <b>Отменено.</b> Платёж удалён.\n\n<s>" + esc(old.split("\n")[0]) + "</s>") if row else "Этот платёж уже удалён.",
+                parse_mode="HTML")
+        return
+    if data.startswith("p:"):
+        _, did, amount, d_, rate, is_usd = data.split(":")
+        conn = db()
+        try:
+            _, debts = load_state(conn, chat)
+        finally:
+            conn.close()
+        d = next((x for x in debts if x["id"] == int(did) and not x["closed"]), None)
+        tg_call("editMessageReplyMarkup", chat_id=chat, message_id=cb["message"]["message_id"], reply_markup={"inline_keyboard": []})
+        if not d:
+            return send(chat, "Этот долг уже закрыт или удалён.")
+        amt, r, note = payment_from(d, float(amount), is_usd == "1", float(rate) or None, True)
+        if amt is None:
+            return send(chat, note)
+        record_payment(chat, d, amt, r, date.fromisoformat(d_), note)
+
 @app.post("/bot/webhook")
 async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Header(default="")):
     if not hmac.compare_digest(x_telegram_bot_api_secret_token, WEBHOOK_SECRET):
         raise HTTPException(403)
     upd = await request.json()
+    if upd.get("callback_query"):
+        cb = upd["callback_query"]
+        if (cb.get("message") or {}).get("chat", {}).get("type") == "private":
+            handle_callback(cb)
+        return {"ok": True}
     msg = upd.get("message") or {}
     chat = (msg.get("chat") or {}).get("id")
     text = (msg.get("text") or "").strip()
-    if not chat or (msg.get("chat") or {}).get("type") != "private":
+    if not chat or (msg.get("chat") or {}).get("type") != "private" or not text:
         return {"ok": True}
-    if text.startswith("/start"):
-        send(chat, "<b>Temir Daftar</b> — тетрадь твоих долгов.\n\n"
-                   "Записывай, кому и сколько должен, и отмечай платежи. Я посчитаю, когда ты закроешь все долги, "
-                   "и подскажу, как делить деньги каждый месяц.\n\n"
-                   "Напоминания и отчёты включаются в настройках приложения.", [[app_button("Открыть Temir Daftar")]])
-    elif text.startswith("/report"):
+    cmd = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
+    if cmd == "/start":
+        send(chat, WELCOME, [[app_button("Открыть Temir Daftar")]])
+    elif cmd == "/help":
+        send(chat, HELP, [[app_button("Открыть приложение")]])
+    elif cmd in ("/report", "/plan", "/dolgi", "/dolg"):
         conn = db()
         try:
             user, debts = load_state(conn, chat)
         finally:
             conn.close()
-        if user and debts:
-            send_animated(chat, summary_lines(user, debts, today()), [[app_button("Открыть приложение")]])
+        if not user or not debts:
+            send(chat, "Пока нет долгов. Добавь первый в приложении.", [[app_button("Открыть Temir Daftar")]])
         else:
-            send(chat, "Пока нет данных. Откройте приложение и добавьте первый долг.", [[app_button("Открыть Temir Daftar")]])
-    elif text:
-        send(chat, "Всё управление — в приложении.", [[app_button("Открыть Temir Daftar")]])
+            t = today()
+            lines = summary_lines(user, debts, t) if cmd == "/report" else plan_lines(user, debts, t) if cmd == "/plan" else debts_lines(debts, t)
+            send_animated(chat, lines, [[app_button("Открыть приложение")]])
+    elif cmd:
+        send(chat, "Не знаю такой команды.\n\n" + HELP)
+    else:
+        handle_text(chat, text)
     return {"ok": True}
 
 @app.get("/bot/setup")
@@ -510,9 +779,8 @@ def bot_setup(key: str = ""):
     if not BOT_TOKEN or not hmac.compare_digest(key, SETUP_KEY):
         raise HTTPException(403)
     a = tg_call("setWebhook", url=f"{API_URL}/bot/webhook", secret_token=WEBHOOK_SECRET,
-                allowed_updates=["message"], drop_pending_updates=True)
-    b = tg_call("setMyCommands", commands=[{"command": "start", "description": "Открыть Temir Daftar"},
-                                           {"command": "report", "description": "Сводка по долгам"}])
+                allowed_updates=["message", "callback_query"], drop_pending_updates=True)
+    b = tg_call("setMyCommands", commands=COMMANDS)
     c = tg_call("setChatMenuButton", menu_button={"type": "web_app", "text": "Открыть", "web_app": {"url": APP_URL}})
     names = tg_call("setMyName", name="Temir Daftar")
     about = tg_call("setMyShortDescription", short_description="Система учёта долгов, платежей и плана погашения")

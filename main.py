@@ -1,4 +1,4 @@
-"""Temir Kassa API — personal debt tracker for a Telegram Mini App.
+"""Temir Daftar API — personal debt tracker for a Telegram Mini App.
 
 Runs on Vercel (FastAPI) with Neon Postgres. Every /api request must carry the
 Telegram WebApp initData in the X-Init-Data header; it is verified with the bot
@@ -21,7 +21,7 @@ from openpyxl.utils import get_column_letter
 
 logging.getLogger("httpx").setLevel(logging.WARNING)  # its request log would print the bot token
 
-app = FastAPI(title="Temir Kassa API")
+app = FastAPI(title="Temir Daftar API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://vimovich.github.io"],
@@ -267,7 +267,7 @@ def ym_label(m): return f"{MONTHS_IN[m % 12]} {m // 12}"
 # ─── API ──────────────────────────────────────────────────
 @app.get("/")
 def health():
-    return {"ok": True, "service": "Temir Kassa API", "version": 2}
+    return {"ok": True, "service": "Temir Daftar API", "version": 2}
 
 @app.get("/api/state")
 def get_state(tg=Depends(current_user)):
@@ -437,7 +437,7 @@ def export_excel(tg=Depends(current_user)):
     finally:
         conn.close()
     data = build_excel(debts)
-    name = f"temir_kassa_{today().strftime('%Y-%m-%d')}.xlsx"
+    name = f"temir_daftar_{today().strftime('%Y-%m-%d')}.xlsx"
     r = httpx.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendDocument",
                    data={"chat_id": tg["id"], "caption": "Все долги и платежи за всё время"},
                    files={"document": (name, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
@@ -487,8 +487,8 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
     if not chat or (msg.get("chat") or {}).get("type") != "private":
         return {"ok": True}
     if text.startswith("/start"):
-        send(chat, "<b>Temir Kassa</b> — учёт долгов.\n\nЗапиши долги, отмечай платежи, а я напомню 10 и 20 числа, "
-                   "сколько осталось отдать в этом месяце.", [[app_button("Открыть Temir Kassa")]])
+        send(chat, "<b>Temir Daftar</b> — учёт долгов.\n\nЗапиши долги, отмечай платежи, а я напомню 10 и 20 числа, "
+                   "сколько осталось отдать в этом месяце.", [[app_button("Открыть Temir Daftar")]])
     elif text.startswith("/report"):
         conn = db()
         try:
@@ -498,9 +498,9 @@ async def webhook(request: Request, x_telegram_bot_api_secret_token: str = Heade
         if user and debts:
             send_animated(chat, summary_lines(user, debts, today()), [[app_button("Открыть приложение")]])
         else:
-            send(chat, "Пока нет данных. Откройте приложение и добавьте первый долг.", [[app_button("Открыть Temir Kassa")]])
+            send(chat, "Пока нет данных. Откройте приложение и добавьте первый долг.", [[app_button("Открыть Temir Daftar")]])
     elif text:
-        send(chat, "Всё управление — в приложении.", [[app_button("Открыть Temir Kassa")]])
+        send(chat, "Всё управление — в приложении.", [[app_button("Открыть Temir Daftar")]])
     return {"ok": True}
 
 @app.get("/bot/setup")
@@ -509,7 +509,7 @@ def bot_setup(key: str = ""):
         raise HTTPException(403)
     a = tg_call("setWebhook", url=f"{API_URL}/bot/webhook", secret_token=WEBHOOK_SECRET,
                 allowed_updates=["message"], drop_pending_updates=True)
-    b = tg_call("setMyCommands", commands=[{"command": "start", "description": "Открыть Temir Kassa"},
+    b = tg_call("setMyCommands", commands=[{"command": "start", "description": "Открыть Temir Daftar"},
                                            {"command": "report", "description": "Сводка по долгам"}])
     c = tg_call("setChatMenuButton", menu_button={"type": "web_app", "text": "Открыть", "web_app": {"url": APP_URL}})
     info = tg_call("getWebhookInfo")

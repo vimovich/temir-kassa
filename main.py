@@ -3,13 +3,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
-import sqlite3, json, io, re
+import os, io, uuid
+import psycopg
+from psycopg.rows import dict_row
 from datetime import datetime
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
-app = FastAPI(title="Pulim API")
+app = FastAPI(title="Temir Kassa API")
 
 app.add_middleware(
     CORSMiddleware,
@@ -18,63 +20,80 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-DB = "pulim.db"
+DATABASE_URL = (os.environ.get("DATABASE_URL") or os.environ.get("POSTGRES_URL")
+                or os.environ.get("POSTGRES_URL_NON_POOLING") or "")
 
-# ─── DATABASE SETUP ───────────────────────────────────────
+class Conn:
+    """Small wrapper so the endpoints keep the sqlite-like API."""
+    def __init__(self):
+        self.c = psycopg.connect(DATABASE_URL, row_factory=dict_row, prepare_threshold=None)
+    def execute(self, sql, params=()):
+        return self.c.execute(sql.replace("?", "%s"), params)
+    def cursor(self):
+        return self
+    def commit(self):
+        self.c.commit()
+    def close(self):
+        self.c.close()
+
+_initialized = False
+
 def get_db():
-    conn = sqlite3.connect(DB)
-    conn.row_factory = sqlite3.Row
+    global _initialized
+    if not DATABASE_URL:
+        raise HTTPException(500, "DATABASE_URL is not configured")
+    conn = Conn()
+    if not _initialized:
+        init_db(conn)
+        _initialized = True
     return conn
 
-def init_db():
-    conn = get_db()
-    c = conn.cursor()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
+def init_db(conn):
+    for stmt in [
+        """CREATE TABLE IF NOT EXISTS users (
             telegram_id TEXT PRIMARY KEY,
             name        TEXT,
             theme       TEXT DEFAULT 'dark',
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS budgets (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at  TEXT DEFAULT to_char(now(), 'YYYY-MM-DD HH24:MI:SS'))""",
+        """CREATE TABLE IF NOT EXISTS budgets (
+            id          SERIAL PRIMARY KEY,
             telegram_id TEXT,
             year        INTEGER,
             month       INTEGER,
-            amount      REAL DEFAULT 0,
-            UNIQUE(telegram_id, year, month)
-        );
-        CREATE TABLE IF NOT EXISTS transactions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            amount      DOUBLE PRECISION DEFAULT 0,
+            UNIQUE(telegram_id, year, month))""",
+        """CREATE TABLE IF NOT EXISTS transactions (
+            id          SERIAL PRIMARY KEY,
             telegram_id TEXT,
             type        TEXT,
-            amount      REAL,
+            amount      DOUBLE PRECISION,
             name        TEXT,
             cat_id      TEXT,
             date        TEXT,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS categories (
+            created_at  TEXT DEFAULT to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.US'))""",
+        """CREATE TABLE IF NOT EXISTS categories (
             id          TEXT PRIMARY KEY,
             telegram_id TEXT,
             cat_type    TEXT,
             emoji       TEXT,
             name        TEXT,
-            position    INTEGER DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS wishes (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            position    INTEGER DEFAULT 0)""",
+        """CREATE TABLE IF NOT EXISTS wishes (
+            id          SERIAL PRIMARY KEY,
             telegram_id TEXT,
             emoji       TEXT,
             name        TEXT,
-            price       REAL,
-            created_at  TEXT DEFAULT (datetime('now'))
-        );
-    """)
+            price       DOUBLE PRECISION,
+            created_at  TEXT DEFAULT to_char(clock_timestamp(), 'YYYY-MM-DD HH24:MI:SS.US'))""",
+        "CREATE INDEX IF NOT EXISTS tx_user_date ON transactions(telegram_id, date)",
+        "CREATE INDEX IF NOT EXISTS cat_user ON categories(telegram_id)",
+    ]:
+        conn.execute(stmt)
     conn.commit()
-    conn.close()
 
-init_db()
+@app.get("/")
+def health():
+    return {"ok": True, "service": "Temir Kassa API"}
 
 # ─── MODELS ───────────────────────────────────────────────
 class UserIn(BaseModel):
@@ -130,7 +149,6 @@ def ensure_user_categories(telegram_id: str, conn):
     c = conn.cursor()
     existing = c.execute("SELECT id FROM categories WHERE telegram_id=?", (telegram_id,)).fetchall()
     if not existing:
-        import uuid
         for i, (emoji, name) in enumerate(DEFAULT_EXPENSE_CATS):
             c.execute("INSERT INTO categories(id,telegram_id,cat_type,emoji,name,position) VALUES(?,?,?,?,?,?)",
                       (str(uuid.uuid4())[:8], telegram_id, "expense", emoji, name, i))
@@ -196,10 +214,10 @@ def add_transaction(t: TransactionIn):
     conn = get_db()
     cur = conn.execute("""
         INSERT INTO transactions(telegram_id,type,amount,name,cat_id,date)
-        VALUES(?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?) RETURNING id
     """, (t.telegram_id, t.type, t.amount, t.name, t.cat_id, t.date))
+    tx_id = cur.fetchone()["id"]
     conn.commit()
-    tx_id = cur.lastrowid
     conn.close()
     return {"ok": True, "id": tx_id}
 
@@ -208,9 +226,9 @@ def get_transactions(telegram_id: str, year: int, month: int):
     conn = get_db()
     rows = conn.execute("""
         SELECT * FROM transactions
-        WHERE telegram_id=? AND strftime('%Y',date)=? AND strftime('%m',date)=?
+        WHERE telegram_id=? AND date LIKE ?
         ORDER BY date DESC, created_at DESC
-    """, (telegram_id, str(year), f"{month:02d}")).fetchall()
+    """, (telegram_id, f"{year}-{month:02d}%")).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
@@ -235,12 +253,11 @@ def get_categories(telegram_id: str):
 
 @app.post("/categories")
 def add_category(c: CategoryIn):
-    import uuid
     conn = get_db()
     max_pos = conn.execute("""
-        SELECT COALESCE(MAX(position),0)+1 FROM categories
+        SELECT COALESCE(MAX(position),0)+1 AS p FROM categories
         WHERE telegram_id=? AND cat_type=?
-    """, (c.telegram_id, c.cat_type)).fetchone()[0]
+    """, (c.telegram_id, c.cat_type)).fetchone()["p"]
     cat_id = str(uuid.uuid4())[:8]
     conn.execute("INSERT INTO categories(id,telegram_id,cat_type,emoji,name,position) VALUES(?,?,?,?,?,?)",
                  (cat_id, c.telegram_id, c.cat_type, c.emoji, c.name, max_pos))
@@ -270,17 +287,17 @@ def reorder_categories(r: CategoryReorder):
 @app.get("/wishes")
 def get_wishes(telegram_id: str):
     conn = get_db()
-    rows = conn.execute("SELECT * FROM wishes WHERE telegram_id=? ORDER BY created_at", (telegram_id,)).fetchall()
+    rows = conn.execute("SELECT * FROM wishes WHERE telegram_id=? ORDER BY created_at, id", (telegram_id,)).fetchall()
     conn.close()
     return [dict(r) for r in rows]
 
 @app.post("/wishes")
 def add_wish(w: WishIn):
     conn = get_db()
-    cur = conn.execute("INSERT INTO wishes(telegram_id,emoji,name,price) VALUES(?,?,?,?)",
+    cur = conn.execute("INSERT INTO wishes(telegram_id,emoji,name,price) VALUES(?,?,?,?) RETURNING id",
                        (w.telegram_id, w.emoji, w.name, w.price))
+    wish_id = cur.fetchone()["id"]
     conn.commit()
-    wish_id = cur.lastrowid
     conn.close()
     return {"ok": True, "id": wish_id}
 
@@ -328,7 +345,7 @@ def export_excel(telegram_id: str):
         bottom=Side(style="thin", color="E0E0E0"),
     )
 
-    ws.append([f"Pulim — {user_name}", "", "", "", ""])
+    ws.append([f"Temir Kassa — {user_name}", "", "", "", ""])
     ws.merge_cells("A1:E1")
     ws["A1"].font = Font(bold=True, size=14, color="1A1A2E")
     ws["A1"].alignment = center
@@ -415,7 +432,7 @@ def export_excel(telegram_id: str):
     wb.save(stream)
     stream.seek(0)
 
-    filename = f"pulim_{telegram_id}_{datetime.now().strftime('%Y%m%d')}.xlsx"
+    filename = f"temir_kassa_{telegram_id}_{datetime.now().strftime('%Y%m%d')}.xlsx"
     return StreamingResponse(
         stream,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
